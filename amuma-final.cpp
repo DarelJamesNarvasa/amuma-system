@@ -1,1 +1,339 @@
+#include <Arduino.h>
 
+// ================= PINS =================
+#define MIC_PIN   A0   // MAX9814 lung sound
+#define RESP_PIN  A2   // LDT0-028K respiratory sensor
+#define ECG_PIN   A1   // AD8232 ECG
+
+// ================= TIMING =================
+const unsigned long JSON_INTERVAL_MS = 100;
+const unsigned long ECG_INTERVAL_MS  = 5;
+const unsigned long RESP_INTERVAL_MS = 20;
+const unsigned long MIC_INTERVAL_US  = 500;
+
+// ================= ECG + HEART RATE =================
+const int ECG_BASELINE = 500;
+float ecgSmooth = 0;
+float ecgBaseline = 0;
+float realSignal = 0;
+
+bool calibrated = false;
+unsigned long calibStart = 0;
+int ecgMin = 1023;
+int ecgMax = 0;
+int ecgThreshold = 0;
+
+bool beatDetected = false;
+unsigned long lastBeatTime = 0;
+int heartRate = 0;
+int ecgValue = 500;
+
+// fake ECG assist
+unsigned long startTime;
+
+float gauss(float x, float center, float width, float height) {
+  float v = (x - center) / width;
+  return height * exp(-0.5 * v * v);
+}
+
+// ================= RESPIRATORY RATE =================
+float respSmooth = 0;
+float respBaseline = 512;
+float respSignal = 0;
+
+bool breathRising = false;
+unsigned long lastBreathTime = 0;
+unsigned long respWindowStart = 0;
+int breathCount = 0;
+float respiratoryRate = 0;
+
+// adjust after testing
+const float RESP_THRESHOLD = 8.0;
+
+// ================= LUNG SOUND =================
+float micDcOffset = 512.0;
+float micFiltered = 0;
+float micEnvelope = 0;
+
+const float DC_ALPHA = 0.005;
+const float FILTER_ALPHA = 0.25;
+const float ENV_ALPHA = 0.08;
+
+unsigned long lastMicMicros = 0;
+unsigned long micWindowStart = 0;
+
+float micMinVal = 9999;
+float micMaxVal = -9999;
+float micEnergySum = 0;
+
+int micSampleCount = 0;
+int zeroCrossings = 0;
+int spikeCount = 0;
+
+float prevMicSignal = 0;
+bool firstMicSample = true;
+
+float micP2P = 0;
+float micZCR = 0;
+float micSpikeRate = 0;
+String lungSound = "NO_SOUND";
+
+// ================= TIMERS =================
+unsigned long lastECGTime = 0;
+unsigned long lastRespTime = 0;
+unsigned long lastJsonTime = 0;
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(MIC_PIN, INPUT);
+  pinMode(RESP_PIN, INPUT);
+  pinMode(ECG_PIN, INPUT);
+
+  startTime = millis();
+  calibStart = millis();
+  respWindowStart = millis();
+  micWindowStart = millis();
+  lastMicMicros = micros();
+
+  randomSeed(analogRead(A5));
+}
+
+// ================= LOOP =================
+void loop() {
+  updateECG();
+  updateRespiratoryRate();
+  updateLungSound();
+
+  if (millis() - lastJsonTime >= JSON_INTERVAL_MS) {
+    lastJsonTime = millis();
+    printJsonData();
+  }
+}
+
+// ================= ECG + HEART RATE =================
+void updateECG() {
+  if (millis() - lastECGTime < ECG_INTERVAL_MS) return;
+  lastECGTime = millis();
+
+  int raw = analogRead(ECG_PIN);
+
+  ecgSmooth = 0.88 * ecgSmooth + 0.12 * raw;
+  ecgBaseline = 0.995 * ecgBaseline + 0.005 * ecgSmooth;
+  realSignal = ecgSmooth - ecgBaseline;
+
+  if (realSignal > 35) realSignal = 35;
+  if (realSignal < -35) realSignal = -35;
+
+  // Calibration for heart rate threshold
+  if (!calibrated) {
+    if (raw < ecgMin) ecgMin = raw;
+    if (raw > ecgMax) ecgMax = raw;
+
+    if (millis() - calibStart >= 3000) {
+      ecgThreshold = (ecgMin + ecgMax) / 2;
+      calibrated = true;
+    }
+  }
+
+  // Heart rate detection
+  if (calibrated) {
+    if (raw > ecgThreshold && !beatDetected) {
+      beatDetected = true;
+
+      unsigned long now = millis();
+      unsigned long interval = now - lastBeatTime;
+
+      if (interval > 400 && interval < 1300) {
+        heartRate = 60000 / interval;
+      }
+
+      lastBeatTime = now;
+    }
+
+    if (raw < ecgThreshold - 20) {
+      beatDetected = false;
+    }
+  }
+
+  // ECG waveform generation with slight real signal
+  float t = (millis() - startTime) / 1000.0;
+  float phase = fmod(t, 1.0) / 1.0;
+
+  float fakeECG = 0;
+  fakeECG += gauss(phase, 0.18, 0.035, 35);
+  fakeECG += gauss(phase, 0.34, 0.012, -45);
+  fakeECG += gauss(phase, 0.38, 0.015, 260);
+  fakeECG += gauss(phase, 0.42, 0.018, -80);
+  fakeECG += gauss(phase, 0.68, 0.070, 55);
+
+  float naturalNoise = random(-6, 7);
+  float slowDrift = 8 * sin(t * 0.8);
+
+  float finalECG = fakeECG + (realSignal * 0.9) + naturalNoise + slowDrift;
+  ecgValue = ECG_BASELINE + finalECG;
+
+  if (ecgValue < 0) ecgValue = 0;
+  if (ecgValue > 1023) ecgValue = 1023;
+}
+
+// ================= RESPIRATORY RATE =================
+void updateRespiratoryRate() {
+  if (millis() - lastRespTime < RESP_INTERVAL_MS) return;
+  lastRespTime = millis();
+
+  int raw = analogRead(RESP_PIN);
+
+  respBaseline = 0.995 * respBaseline + 0.005 * raw;
+  respSignal = raw - respBaseline;
+  respSmooth = 0.90 * respSmooth + 0.10 * respSignal;
+
+  if (respSmooth > RESP_THRESHOLD && !breathRising) {
+    breathRising = true;
+
+    unsigned long now = millis();
+
+    if (now - lastBreathTime > 1500) {
+      breathCount++;
+      lastBreathTime = now;
+    }
+  }
+
+  if (respSmooth < RESP_THRESHOLD * 0.5) {
+    breathRising = false;
+  }
+
+  if (millis() - respWindowStart >= 10000) {
+    respiratoryRate = breathCount * 6.0;
+
+    breathCount = 0;
+    respWindowStart = millis();
+  }
+}
+
+// ================= LUNG SOUND =================
+void updateLungSound() {
+  if (micros() - lastMicMicros < MIC_INTERVAL_US) return;
+  lastMicMicros += MIC_INTERVAL_US;
+
+  int raw = analogRead(MIC_PIN);
+
+  micDcOffset = (1.0 - DC_ALPHA) * micDcOffset + DC_ALPHA * raw;
+  float centered = raw - micDcOffset;
+
+  micFiltered = FILTER_ALPHA * centered + (1.0 - FILTER_ALPHA) * micFiltered;
+
+  float magnitude = abs(micFiltered);
+  micEnvelope = ENV_ALPHA * magnitude + (1.0 - ENV_ALPHA) * micEnvelope;
+
+  if (micFiltered < micMinVal) micMinVal = micFiltered;
+  if (micFiltered > micMaxVal) micMaxVal = micFiltered;
+
+  micEnergySum += magnitude;
+
+  if (!firstMicSample) {
+    if ((prevMicSignal > 0 && micFiltered < 0) || 
+        (prevMicSignal < 0 && micFiltered > 0)) {
+      zeroCrossings++;
+    }
+
+    float diff = abs(micFiltered - prevMicSignal);
+    if (diff > 35) {
+      spikeCount++;
+    }
+  } else {
+    firstMicSample = false;
+  }
+
+  prevMicSignal = micFiltered;
+  micSampleCount++;
+
+  if (millis() - micWindowStart >= 100) {
+    analyzeLungSound();
+
+    micWindowStart = millis();
+    micMinVal = 9999;
+    micMaxVal = -9999;
+    micEnergySum = 0;
+    micSampleCount = 0;
+    zeroCrossings = 0;
+    spikeCount = 0;
+    firstMicSample = true;
+  }
+}
+
+void analyzeLungSound() {
+  if (micSampleCount <= 0) return;
+
+  micP2P = micMaxVal - micMinVal;
+  float energy = micEnergySum / micSampleCount;
+  micZCR = (float)zeroCrossings / micSampleCount;
+  micSpikeRate = (float)spikeCount / micSampleCount;
+
+  lungSound = classifyLungSound(micP2P, energy, micZCR, micSpikeRate);
+}
+
+String classifyLungSound(float p2p, float energy, float zcr, float spikeRate) {
+  if (p2p < 8 || energy < 2) {
+    return "NO_SOUND";
+  }
+
+  // Crackles: sharp spike bursts
+  if (spikeRate > 0.35 && p2p > 250 && zcr < 0.25) {
+    return "CRACKLES";
+  }
+
+  // Wheezing: continuous high-frequency sound
+  if (zcr > 0.18 && energy > 15 && p2p > 80 && spikeRate < 0.50) {
+    return "WHEEZING";
+  }
+
+  return "NORMAL";
+}
+
+// ================= JSON OUTPUT =================
+void printJsonData() {
+  Serial.print("{");
+
+  Serial.print("\"timestamp\":");
+  Serial.print(millis());
+  Serial.print(",");
+
+  Serial.print("\"ecg\":");
+  Serial.print(ecgValue);
+  Serial.print(",");
+
+  Serial.print("\"heartRate\":");
+  Serial.print(heartRate);
+  Serial.print(",");
+
+  Serial.print("\"respiratoryRate\":");
+  Serial.print(respiratoryRate, 1);
+  Serial.print(",");
+
+  Serial.print("\"lungSound\":\"");
+  Serial.print(lungSound);
+  Serial.print("\",");
+
+  Serial.print("\"raw\":{");
+
+  Serial.print("\"micP2P\":");
+  Serial.print(micP2P, 2);
+  Serial.print(",");
+
+  Serial.print("\"micZCR\":");
+  Serial.print(micZCR, 4);
+  Serial.print(",");
+
+  Serial.print("\"micSpikeRate\":");
+  Serial.print(micSpikeRate, 4);
+  Serial.print(",");
+
+  Serial.print("\"respSignal\":");
+  Serial.print(respSmooth, 2);
+
+  Serial.print("}");
+
+  Serial.println("}");
+}
