@@ -1,1 +1,22 @@
+String classifySound(float p2p, float energy, float zcr, float spikeRate) {
+  if (p2p < 8 || energy < 2) {
+    return "NO_SOUND";
+  }
 
+  // CRACKLES: short, sharp, high spike burst
+  if (spikeRate > 0.60 && p2p > 330) {
+    return "CRACKLES";
+  }
+
+  // WHEEZING: continuous high-frequency sound
+  if (zcr > 0.18 && energy > 20 && p2p > 120 && spikeRate <= 0.60) {
+    return "WHEEZING";
+  }
+
+  // Possible smaller crackle bursts
+  if (spikeRate > 0.35 && p2p > 450 && zcr < 0.18) {
+    return "CRACKLES";
+  }
+
+  return "NORMAL";
+}
