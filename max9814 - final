@@ -1,3 +1,141 @@
+/*
+  MAX9814 Lung Sound Detection
+  Arduino Uno/Nano
+
+  Wiring:
+  MAX9814 VCC  -> 5V
+  MAX9814 GND  -> GND
+  MAX9814 OUT  -> A0
+
+  PLX-DAQ Output:
+  Time_ms, Raw, Filtered, Envelope, P2P, ZCR, Spikes, State
+*/
+
+#define MIC_PIN A0
+
+const unsigned long SAMPLE_INTERVAL_US = 500;   // 2kHz sampling
+const unsigned long WINDOW_MS = 100;            // analyze every 100ms
+
+float dcOffset = 512.0;
+float filtered = 0;
+float envelope = 0;
+
+const float DC_ALPHA = 0.005;
+const float FILTER_ALPHA = 0.25;
+const float ENV_ALPHA = 0.08;
+
+unsigned long lastSampleMicros = 0;
+unsigned long windowStart = 0;
+
+// Window variables
+float minVal = 9999;
+float maxVal = -9999;
+float energySum = 0;
+
+int sampleCount = 0;
+int zeroCrossings = 0;
+int spikeCount = 0;
+
+float prevSignal = 0;
+bool firstSample = true;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("CLEARDATA");
+  Serial.println("LABEL,Time_ms,Raw,Filtered,Envelope,P2P,ZCR,Spikes,State");
+
+  windowStart = millis();
+  lastSampleMicros = micros();
+}
+
+void loop() {
+  if (micros() - lastSampleMicros >= SAMPLE_INTERVAL_US) {
+    lastSampleMicros += SAMPLE_INTERVAL_US;
+
+    int raw = analogRead(MIC_PIN);
+
+    // Remove DC offset
+    dcOffset = (1.0 - DC_ALPHA) * dcOffset + DC_ALPHA * raw;
+    float centered = raw - dcOffset;
+
+    // Smooth signal
+    filtered = FILTER_ALPHA * centered + (1.0 - FILTER_ALPHA) * filtered;
+
+    // Envelope
+    float magnitude = abs(filtered);
+    envelope = ENV_ALPHA * magnitude + (1.0 - ENV_ALPHA) * envelope;
+
+    // Min/max for peak-to-peak
+    if (filtered < minVal) minVal = filtered;
+    if (filtered > maxVal) maxVal = filtered;
+
+    energySum += magnitude;
+
+    // Zero crossing
+    if (!firstSample) {
+      if ((prevSignal > 0 && filtered < 0) || (prevSignal < 0 && filtered > 0)) {
+        zeroCrossings++;
+      }
+
+      // Crackle spike detection
+      float diff = abs(filtered - prevSignal);
+      if (diff > 35) {
+        spikeCount++;
+      }
+    } else {
+      firstSample = false;
+    }
+
+    prevSignal = filtered;
+    sampleCount++;
+
+    // Analyze every WINDOW_MS
+    if (millis() - windowStart >= WINDOW_MS) {
+      analyzeAndPrint(raw);
+
+      // Reset window
+      windowStart = millis();
+      minVal = 9999;
+      maxVal = -9999;
+      energySum = 0;
+      sampleCount = 0;
+      zeroCrossings = 0;
+      spikeCount = 0;
+      firstSample = true;
+    }
+  }
+}
+
+void analyzeAndPrint(int raw) {
+  if (sampleCount <= 0) return;
+
+  float p2p = maxVal - minVal;
+  float energy = energySum / sampleCount;
+  float zcr = (float)zeroCrossings / sampleCount;
+  float spikeRate = (float)spikeCount / sampleCount;
+
+  String state = classifySound(p2p, energy, zcr, spikeRate);
+
+  Serial.print("DATA,");
+  Serial.print(millis());
+  Serial.print(",");
+  Serial.print(raw);
+  Serial.print(",");
+  Serial.print(filtered, 2);
+  Serial.print(",");
+  Serial.print(envelope, 2);
+  Serial.print(",");
+  Serial.print(p2p, 2);
+  Serial.print(",");
+  Serial.print(zcr, 4);
+  Serial.print(",");
+  Serial.print(spikeRate, 4);
+  Serial.print(",");
+  Serial.println(state);
+}
+
 String classifySound(float p2p, float energy, float zcr, float spikeRate) {
   if (p2p < 8 || energy < 2) {
     return "NO_SOUND";
