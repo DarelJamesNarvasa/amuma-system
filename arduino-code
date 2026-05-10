@@ -1,0 +1,72 @@
+#include <Arduino.h>
+#include <SoftwareSerial.h>
+
+SoftwareSerial espSerial(2, 3); 
+// D2 = RX, D3 = TX going to ESP32 RX
+
+#define MIC_PIN   A0
+#define RESP_PIN  A2
+#define ECG_PIN   A1
+
+unsigned long lastSend = 0;
+const unsigned long SEND_INTERVAL = 1000;
+
+void setup() {
+  Serial.begin(9600);      // Serial Monitor
+  espSerial.begin(9600);   // Arduino to ESP32
+
+  pinMode(MIC_PIN, INPUT);
+  pinMode(RESP_PIN, INPUT);
+  pinMode(ECG_PIN, INPUT);
+
+  Serial.println("Arduino UNO Sender Started");
+}
+
+void loop() {
+  if (millis() - lastSend >= SEND_INTERVAL) {
+    lastSend = millis();
+
+    int ecgRaw = analogRead(ECG_PIN);
+    int respRaw = analogRead(RESP_PIN);
+    int micRaw = analogRead(MIC_PIN);
+
+   int heartRate;
+
+  if (ecgRaw < 100 || ecgRaw > 1000) {
+    heartRate = 0;
+  } else {
+    heartRate = map(ecgRaw, 300, 900, 60, 120);
+    heartRate = constrain(heartRate, 60, 150);
+  }
+
+    int respiratoryRate = map(respRaw, 300, 700, 12, 25);
+    respiratoryRate = constrain(respiratoryRate, 0, 40);
+
+    String lungSound = "NORMAL";
+
+    if (micRaw < 50) {
+      lungSound = "NO_SOUND";
+    } else if (micRaw > 750) {
+      lungSound = "CRACKLES";
+    } else if (micRaw > 550) {
+      lungSound = "WHEEZING";
+    } else {
+      lungSound = "NORMAL";
+    }
+
+    String json = "{";
+    json += "\"timestamp\":" + String(millis()) + ",";
+    json += "\"ecg\":" + String(ecgRaw) + ",";
+    json += "\"heartRate\":" + String(heartRate) + ",";
+    json += "\"respiratoryRate\":" + String(respiratoryRate) + ",";
+    json += "\"lungSound\":\"" + lungSound + "\",";
+    json += "\"raw\":{";
+    json += "\"micRaw\":" + String(micRaw) + ",";
+    json += "\"respRaw\":" + String(respRaw) + ",";
+    json += "\"ecgRaw\":" + String(ecgRaw);
+    json += "}}";
+
+    espSerial.println(json);
+    Serial.println(json);
+  }
+}
