@@ -1,187 +1,229 @@
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
+    #include <Arduino.h>
+    #include <ArduinoJson.h>
+    #include <WiFi.h>
+    #include <WiFiClientSecure.h>
+    #include <HTTPClient.h>
 
-// WIFI
-const char* WIFI_SSID = "NARVASA_Wifi";
-const char* WIFI_PASSWORD = "@Narvasa96";
+    // WIFI
+    const char* WIFI_SSID = "NARVASA_Wifi";
+    const char* WIFI_PASSWORD = "@Narvasa96";
 
+    // FIREBASE
+    const char* FIREBASE_HOST =
+    "https://amuma-smart-bra-data-default-rtdb.asia-southeast1.firebasedatabase.app";
 
-// FIREBASE
-const char* FIREBASE_HOST = "https://amuma-smart-bra-data-default-rtdb.asia-southeast1.firebasedatabase.app";
+    // DEVICE
+    String DEVICE_ID = "device_1";
 
-// DEVICE
-String DEVICE_ID = "device_1";
+    // ECG BUFFER
+    const int ECG_SAMPLE_COUNT = 40;
+    int ecgSamples[ECG_SAMPLE_COUNT];
 
-// SEND INTERVAL
-unsigned long lastSend = 0;
-const unsigned long SEND_INTERVAL = 10;
+    // SERIAL DATA
+    String incomingData = "";
 
-// ECG BUFFER
-const int ECG_SAMPLE_COUNT = 40;
-int ecgSamples[ECG_SAMPLE_COUNT];
+    // ---------------- WIFI ----------------
+    void connectWiFi() {
+      Serial.print("Connecting to WiFi");
 
-float waveIndex = 0;
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-// ---------------- WIFI ----------------
-void connectWiFi() {
-  Serial.print("Connecting to WiFi");
+      while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+      }
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println();
-  Serial.println("WiFi connected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-}
-
-// ---------------- ECG ----------------
-void initEcgSamples() {
-  for (int i = 0; i < ECG_SAMPLE_COUNT; i++) {
-    ecgSamples[i] = 520;
-  }
-}
-
-int generateECGValue() {
-  int baseline = 520;
-  int noise = random(-10, 11);
-
-  int ecg = baseline + noise;
-
-  int beatPosition = ((int)waveIndex) % 25;
-
-  if (beatPosition == 3) ecg = 500;
-  if (beatPosition == 4) ecg = 545;
-  if (beatPosition == 5) ecg = 720;   // ECG peak
-  if (beatPosition == 6) ecg = 535;
-  if (beatPosition == 7) ecg = 490;
-  if (beatPosition == 8) ecg = 510;
-
-  waveIndex++;
-
-  return ecg;
-}
-
-void addNewEcgSample(int newValue) {
-  for (int i = 0; i < ECG_SAMPLE_COUNT - 1; i++) {
-    ecgSamples[i] = ecgSamples[i + 1];
-  }
-
-  ecgSamples[ECG_SAMPLE_COUNT - 1] = newValue;
-}
-
-String makeEcgSamplesJson() {
-  String samples = "{";
-
-  for (int i = 0; i < ECG_SAMPLE_COUNT; i++) {
-    samples += "\"" + String(i) + "\":" + String(ecgSamples[i]);
-
-    if (i < ECG_SAMPLE_COUNT - 1) {
-      samples += ",";
+      Serial.println();
+      Serial.println("WiFi connected!");
+      Serial.print("IP Address: ");
+      Serial.println(WiFi.localIP());
     }
-  }
 
-  samples += "}";
-  return samples;
-}
+    // ---------------- ECG BUFFER ----------------
+    void initEcgSamples() {
+      for (int i = 0; i < ECG_SAMPLE_COUNT; i++) {
+        ecgSamples[i] = 520;
+      }
+    }
 
-// ---------------- LUNG SOUND ----------------
-String generateLungSound(int micRaw) {
-  if (micRaw > 680) {
-    return "CRACKLES";
-  } else if (micRaw > 480) {
-    return "Mild Wheeze";
-  } else {
-    return "NORMAL";
-  }
-}
+    void addNewEcgSample(int newValue) {
+      for (int i = 0; i < ECG_SAMPLE_COUNT - 1; i++) {
+        ecgSamples[i] = ecgSamples[i + 1];
+      }
 
-// ---------------- FIREBASE ----------------
-void sendChangingDataToFirebase() {
-  WiFiClientSecure client;
-  client.setInsecure();
+      ecgSamples[ECG_SAMPLE_COUNT - 1] = newValue;
+    }
 
-  HTTPClient https;
+    String makeEcgSamplesJson() {
+      String samples = "{";
 
-  String url = String(FIREBASE_HOST) + "/amuma/devices/" + DEVICE_ID + "/currentReadings.json";
+      for (int i = 0; i < ECG_SAMPLE_COUNT; i++) {
+        samples += "\"" + String(i) + "\":" + String(ecgSamples[i]);
 
-  unsigned long timestamp = millis();
+        if (i < ECG_SAMPLE_COUNT - 1) {
+          samples += ",";
+        }
+      }
 
-  int ecgRaw = generateECGValue();
-  addNewEcgSample(ecgRaw);
+      samples += "}";
+      return samples;
+    }
 
-  int heartRate = 85 + random(-8, 10);
-  heartRate = constrain(heartRate, 70, 105);
+    // ---------------- FIREBASE ----------------
+    void sendToFirebase(String jsonPayload) {
+      if (WiFi.status() != WL_CONNECTED) {
+        connectWiFi();
+      }
 
-  int respiratoryRate = 21 + random(-4, 5);
-  respiratoryRate = constrain(respiratoryRate, 14, 30);
+      WiFiClientSecure client;
+      client.setInsecure();
 
-  int micRaw = 220 + random(-40, 450);
-  micRaw = constrain(micRaw, 180, 750);
+      HTTPClient https;
 
-  int respRaw = 650 + random(-80, 90);
-  respRaw = constrain(respRaw, 450, 850);
+      String url =
+        String(FIREBASE_HOST) +
+        "/amuma/devices/" +
+        DEVICE_ID +
+        "/currentReadings.json";
 
-  String lungSound = generateLungSound(micRaw);
+      Serial.println("Sending to Firebase:");
+      Serial.println(jsonPayload);
 
-  String jsonPayload = "{";
-  jsonPayload += "\"timestamp\":" + String(timestamp) + ",";
-  jsonPayload += "\"deviceId\":\"" + DEVICE_ID + "\",";
-  jsonPayload += "\"ecg\":" + String(ecgRaw) + ",";
-  jsonPayload += "\"heartRate\":" + String(heartRate) + ",";
-  jsonPayload += "\"respiratoryRate\":" + String(respiratoryRate) + ",";
-  jsonPayload += "\"lungSound\":\"" + lungSound + "\",";
-  jsonPayload += "\"ecgSamples\":" + makeEcgSamplesJson() + ",";
-  jsonPayload += "\"raw\":{";
-  jsonPayload += "\"micRaw\":" + String(micRaw) + ",";
-  jsonPayload += "\"respRaw\":" + String(respRaw) + ",";
-  jsonPayload += "\"ecgRaw\":" + String(ecgRaw);
-  jsonPayload += "}";
-  jsonPayload += "}";
+      https.begin(client, url);
+      https.addHeader("Content-Type", "application/json");
 
-  Serial.println("Sending JSON:");
-  Serial.println(jsonPayload);
+      int httpCode = https.PUT(jsonPayload);
 
-  https.begin(client, url);
-  https.addHeader("Content-Type", "application/json");
+      String response = https.getString();
 
-  int httpCode = https.PUT(jsonPayload);
-  String response = https.getString();
+      Serial.print("HTTP Code: ");
+      Serial.println(httpCode);
 
-  Serial.print("HTTP Code: ");
-  Serial.println(httpCode);
-  Serial.print("Firebase Response: ");
-  Serial.println(response);
+      Serial.print("Firebase Response: ");
+      Serial.println(response);
 
-  https.end();
-}
+      https.end();
+    }
 
-// ---------------- SETUP ----------------
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
+    // ---------------- PROCESS JSON ----------------
+    void processArduinoData(String data) {
+      data.trim();
 
-  randomSeed(analogRead(34));
+      if (data.length() == 0) return;
 
-  initEcgSamples();
-  connectWiFi();
+      Serial.println("Received JSON:");
+      Serial.println(data);
 
-  Serial.println("ESP32 Firebase ECG Moving Data Started");
-}
+      StaticJsonDocument<512> doc;
 
-// ---------------- LOOP ----------------
-void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
-  }
+      DeserializationError error = deserializeJson(doc, data);
 
-  if (millis() - lastSend >= SEND_INTERVAL) {
-    lastSend = millis();
-    sendChangingDataToFirebase();
-  }
-}
+      if (error) {
+        Serial.print("JSON Parse Error: ");
+        Serial.println(error.c_str());
+        return;
+      }
+
+      // RECEIVED DATA
+      unsigned long timestamp =
+        doc["timestamp"] | millis();
+
+      int ecg =
+        doc["ecg"] | 0;
+
+      int heartRate =
+        doc["heartRate"] | 0;
+
+      int respiratoryRate =
+        doc["respiratoryRate"] | 0;
+
+      const char* lungSound =
+        doc["lungSound"] | "NORMAL";
+
+      int micRaw =
+        doc["raw"]["micRaw"] | 0;
+
+      int respRaw =
+        doc["raw"]["respRaw"] | 0;
+
+      int ecgRaw =
+        doc["raw"]["ecgRaw"] | ecg;
+
+      // UPDATE ECG GRAPH BUFFER
+      addNewEcgSample(ecg);
+
+      // FINAL JSON
+      String jsonPayload = "{";
+
+      jsonPayload +=
+        "\"timestamp\":" + String(timestamp) + ",";
+
+      jsonPayload +=
+        "\"deviceId\":\"" + DEVICE_ID + "\",";
+
+      jsonPayload +=
+        "\"ecg\":" + String(ecg) + ",";
+
+      jsonPayload +=
+        "\"heartRate\":" + String(heartRate) + ",";
+
+      jsonPayload +=
+        "\"respiratoryRate\":" + String(respiratoryRate) + ",";
+
+      jsonPayload +=
+        "\"lungSound\":\"" + String(lungSound) + "\",";
+
+      // ECG SAMPLES
+      jsonPayload +=
+        "\"ecgSamples\":" + makeEcgSamplesJson() + ",";
+
+      // RAW DATA
+      jsonPayload += "\"raw\":{";
+
+      jsonPayload +=
+        "\"micRaw\":" + String(micRaw) + ",";
+
+      jsonPayload +=
+        "\"respRaw\":" + String(respRaw) + ",";
+
+      jsonPayload +=
+        "\"ecgRaw\":" + String(ecgRaw);
+
+      jsonPayload += "}";
+
+      jsonPayload += "}";
+
+      sendToFirebase(jsonPayload);
+    }
+
+    // ---------------- SETUP ----------------
+    void setup() {
+      Serial.begin(9600);
+
+      delay(1000);
+
+      initEcgSamples();
+
+      connectWiFi();
+
+      Serial.println("ESP32 Receiver + Firebase Started");
+    }
+
+    // ---------------- LOOP ----------------
+    void loop() {
+      while (Serial.available()) {
+
+        char c = Serial.read();
+
+        if (c == '\n') {
+
+          processArduinoData(incomingData);
+
+          incomingData = "";
+
+        } else {
+
+          incomingData += c;
+        }
+      }
+    }
