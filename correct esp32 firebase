@@ -4,6 +4,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <time.h>
+#include <sys/time.h>
 
 // WIFI
 const char* WIFI_SSID = "ek";
@@ -59,17 +60,19 @@ void initTime() {
 
   Serial.println();
   Serial.println("NTP time synced!");
+  Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
 }
 
 unsigned long long getRealTimestampMs() {
-  time_t now;
-  time(&now);
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
 
-  if (now < 100000) {
-    return millis(); // fallback only if NTP fails
+  if (tv.tv_sec < 100000) {
+    Serial.println("Warning: NTP time not ready, using millis fallback");
+    return millis();
   }
 
-  return (unsigned long long)now * 1000ULL;
+  return ((unsigned long long)tv.tv_sec * 1000ULL) + (tv.tv_usec / 1000ULL);
 }
 
 // ---------------- ECG BUFFER ----------------
@@ -157,7 +160,7 @@ void processArduinoData(String data) {
     return;
   }
 
-  // Real NTP timestamp before sending to Firebase
+  // Correct real-time timestamp from NTP
   unsigned long long timestamp = getRealTimestampMs();
 
   int ecg = doc["ecg"] | 0;
