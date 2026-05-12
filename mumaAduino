@@ -1,0 +1,228 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <time.h>
+#include <sys/time.h>
+
+// WIFI
+const char* WIFI_SSID = "ek";
+const char* WIFI_PASSWORD = "edrani1209";
+
+// FIREBASE
+const char* FIREBASE_HOST =
+"https://amuma-smart-bra-data-default-rtdb.asia-southeast1.firebasedatabase.app";
+
+// DEVICE
+String DEVICE_ID = "device_1";
+
+// NTP TIME
+const char* NTP_SERVER = "pool.ntp.org";
+const long GMT_OFFSET_SEC = 8 * 3600;   // Philippines UTC+8
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+// ECG BUFFER
+const int ECG_SAMPLE_COUNT = 40;
+int ecgSamples[ECG_SAMPLE_COUNT];
+
+// SERIAL DATA
+String incomingData = "";
+
+// ---------------- WIFI ----------------
+void connectWiFi() {
+  Serial.print("Connecting to WiFi");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ---------------- NTP TIME ----------------
+void initTime() {
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+
+  Serial.print("Syncing NTP time");
+
+  struct tm timeinfo;
+  while (!getLocalTime(&timeinfo)) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  Serial.println();
+  Serial.println("NTP time synced!");
+  Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
+}
+
+unsigned long long getRealTimestampMs() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+
+  if (tv.tv_sec < 100000) {
+    Serial.println("Warning: NTP time not ready, using millis fallback");
+    return millis();
+  }
+
+  return ((unsigned long long)tv.tv_sec * 1000ULL) + (tv.tv_usec / 1000ULL);
+}
+
+// ---------------- ECG BUFFER ----------------
+void initEcgSamples() {
+  for (int i = 0; i < ECG_SAMPLE_COUNT; i++) {
+    ecgSamples[i] = 520;
+  }
+}
+
+void addNewEcgSample(int newValue) {
+  for (int i = 0; i < ECG_SAMPLE_COUNT - 1; i++) {
+    ecgSamples[i] = ecgSamples[i + 1];
+  }
+
+  ecgSamples[ECG_SAMPLE_COUNT - 1] = newValue;
+}
+
+String makeEcgSamplesJson() {
+  String samples = "{";
+
+  for (int i = 0; i < ECG_SAMPLE_COUNT; i++) {
+    samples += "\"" + String(i) + "\":" + String(ecgSamples[i]);
+
+    if (i < ECG_SAMPLE_COUNT - 1) {
+      samples += ",";
+    }
+  }
+
+  samples += "}";
+  return samples;
+}
+
+// ---------------- FIREBASE ----------------
+void sendToFirebase(String jsonPayload) {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+    initTime();
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient https;
+
+  String url =
+    String(FIREBASE_HOST) +
+    "/amuma/devices/" +
+    DEVICE_ID +
+    "/currentReadings.json";
+
+  Serial.println("Sending to Firebase:");
+  Serial.println(jsonPayload);
+
+  https.begin(client, url);
+  https.addHeader("Content-Type", "application/json");
+
+  int httpCode = https.PUT(jsonPayload);
+
+  String response = https.getString();
+
+  Serial.print("HTTP Code: ");
+  Serial.println(httpCode);
+
+  Serial.print("Firebase Response: ");
+  Serial.println(response);
+
+  https.end();
+}
+
+// ---------------- PROCESS JSON ----------------
+void processArduinoData(String data) {
+  data.trim();
+  if (data.length() == 0) return;
+
+  Serial.println("Received JSON:");
+  Serial.println(data);
+
+  StaticJsonDocument<1024> doc;
+
+  DeserializationError error = deserializeJson(doc, data);
+
+  if (error) {
+    Serial.print("JSON Parse Error: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  // Correct real-time timestamp from NTP
+  unsigned long long timestamp = getRealTimestampMs();
+
+  int ecg = doc["ecg"] | 0;
+  int heartRate = doc["heartRate"] | 0;
+
+  float respiratoryRate = doc["respiratoryRate"] | 0.0;
+
+  const char* lungSound = doc["lungSound"] | "NORMAL";
+
+  float micP2P = doc["raw"]["micP2P"] | 0.0;
+  float micZCR = doc["raw"]["micZCR"] | 0.0;
+  float micSpikeRate = doc["raw"]["micSpikeRate"] | 0.0;
+  float respSignal = doc["raw"]["respSignal"] | 0.0;
+
+  addNewEcgSample(ecg);
+
+  String jsonPayload = "{";
+
+  jsonPayload += "\"timestamp\":" + String((uint64_t)timestamp) + ",";
+  jsonPayload += "\"deviceId\":\"" + DEVICE_ID + "\",";
+  jsonPayload += "\"ecg\":" + String(ecg) + ",";
+  jsonPayload += "\"heartRate\":" + String(heartRate) + ",";
+  jsonPayload += "\"respiratoryRate\":" + String(respiratoryRate, 1) + ",";
+  jsonPayload += "\"lungSound\":\"" + String(lungSound) + "\",";
+  jsonPayload += "\"ecgSamples\":" + makeEcgSamplesJson() + ",";
+
+  jsonPayload += "\"raw\":{";
+  jsonPayload += "\"micP2P\":" + String(micP2P, 2) + ",";
+  jsonPayload += "\"micZCR\":" + String(micZCR, 4) + ",";
+  jsonPayload += "\"micSpikeRate\":" + String(micSpikeRate, 4) + ",";
+  jsonPayload += "\"respSignal\":" + String(respSignal, 2);
+  jsonPayload += "}";
+
+  jsonPayload += "}";
+
+  sendToFirebase(jsonPayload);
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(38400);
+
+  delay(1000);
+
+  initEcgSamples();
+
+  connectWiFi();
+  initTime();
+
+  Serial.println("ESP32 Receiver + Firebase Started");
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\n') {
+      processArduinoData(incomingData);
+      incomingData = "";
+    } else {
+      incomingData += c;
+    }
+  }
+}
